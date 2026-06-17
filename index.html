@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VOIX — Maîtrise Orale</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <style>
   :root {
     --black: #0A0A0A;
@@ -820,30 +821,79 @@ const vocabData = {
   ]
 };
 
+// SUPABASE CONFIG
+const SUPABASE_URL = 'https://ejkuawwukpniepzxtdhe.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_YWRgrRq2VXTTgNwz8xzT6A_zS446aUz';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
 // STATE
 let state = {
-  currentDay: parseInt(localStorage.getItem('voix-day') || '1'),
-  streak: parseInt(localStorage.getItem('voix-streak') || '1'),
-  exercisesDone: parseInt(localStorage.getItem('voix-exercises') || '0'),
-  vocabMastered: parseInt(localStorage.getItem('voix-vocab') || '0'),
+  profilId: null,
+  currentDay: 1,
+  streak: 1,
+  exercisesDone: 0,
+  vocabMastered: 0,
   breathActive: false,
   breathPhase: 0,
   breathTimer: null,
-  breathCount: 0
+  breathCount: 0,
+  todayExerciseIds: []
 };
 
-// INIT
-function init() {
+// INIT — charge le profil et les données du jour depuis Supabase
+async function init() {
+  try {
+    // Récupère le profil unique de Joseph
+    const { data: profils, error } = await sb.from('voix_profil').select('*').limit(1);
+    if (error) throw error;
+
+    if (profils && profils.length > 0) {
+      const p = profils[0];
+      state.profilId = p.id;
+      state.currentDay = p.jour_actuel;
+      state.streak = p.streak_actuel;
+    }
+
+    // Compte les exercices complétés aujourd'hui
+    const today = new Date().toISOString().split('T')[0];
+    const { data: exosToday } = await sb
+      .from('voix_exercices')
+      .select('id')
+      .eq('profil_id', state.profilId)
+      .eq('date_completion', today)
+      .eq('complete', true);
+
+    state.exercisesDone = exosToday ? exosToday.length : 0;
+
+    // Compte le vocabulaire maîtrisé (niveau 2)
+    const { data: vocabMaitrise } = await sb
+      .from('voix_vocabulaire')
+      .select('id')
+      .eq('profil_id', state.profilId)
+      .eq('niveau_maitrise', 2);
+
+    state.vocabMastered = vocabMaitrise ? vocabMaitrise.length : 0;
+
+    renderStats();
+    renderWeek(1);
+    await renderVocab();
+  } catch (err) {
+    console.error('Erreur de connexion Supabase:', err);
+    showToast('⚠ Connexion impossible — mode hors-ligne');
+    renderStats();
+    renderWeek(1);
+    renderVocabFallback();
+  }
+}
+
+function renderStats() {
   document.getElementById('current-day').textContent = state.currentDay;
   document.getElementById('streak-count').textContent = state.streak;
   document.getElementById('prog-streak').textContent = state.streak;
   document.getElementById('prog-days').textContent = state.currentDay;
   document.getElementById('stat-done').textContent = state.exercisesDone;
   document.getElementById('stat-vocab').textContent = state.vocabMastered;
-  document.getElementById('prog-daily').style.width = (state.exercisesDone / 3 * 100) + '%';
-
-  renderWeek(1);
-  renderVocab();
+  document.getElementById('prog-daily').style.width = (Math.min(state.exercisesDone,3) / 3 * 100) + '%';
 }
 
 // NAVIGATION
@@ -949,8 +999,41 @@ function renderWeek(num) {
   `;
 }
 
-// VOCAB RENDER
-function renderVocab() {
+// VOCAB RENDER — depuis Supabase
+async function renderVocab() {
+  try {
+    const { data: vocab, error } = await sb
+      .from('voix_vocabulaire')
+      .select('*')
+      .eq('profil_id', state.profilId)
+      .order('created_at');
+
+    if (error) throw error;
+
+    const grouped = { business: [], creative: [], institutional: [], openers: [] };
+    vocab.forEach(v => {
+      if (grouped[v.categorie]) {
+        grouped[v.categorie].push({
+          id: v.id,
+          blocked: v.mot_bloque,
+          fluid: v.mot_fluide,
+          example: v.exemple,
+          niveau: v.niveau_maitrise
+        });
+      }
+    });
+
+    renderVocabSection('vocab-business', grouped.business, 'Business');
+    renderVocabSection('vocab-creative', grouped.creative, 'Créatif');
+    renderVocabSection('vocab-institutional', grouped.institutional, 'Institutionnel');
+    renderVocabSection('vocab-openers', grouped.openers, 'Ouverture');
+  } catch (err) {
+    console.error('Erreur chargement vocabulaire:', err);
+    renderVocabFallback();
+  }
+}
+
+function renderVocabFallback() {
   renderVocabSection('vocab-business', vocabData.business, 'Business');
   renderVocabSection('vocab-creative', vocabData.creative, 'Créatif');
   renderVocabSection('vocab-institutional', vocabData.institutional, 'Institutionnel');
@@ -959,28 +1042,85 @@ function renderVocab() {
 
 function renderVocabSection(id, data, tag) {
   const el = document.getElementById(id);
-  el.innerHTML = data.map(v => `
-    <div class="vocab-item">
+  el.innerHTML = data.map(v => {
+    const niveau = v.niveau || 0;
+    const niveauLabel = niveau === 2 ? '✅ Maîtrisé' : niveau === 1 ? '🔶 En cours' : '⬜ Nouveau';
+    return `
+    <div class="vocab-item" ${v.id ? `onclick="progresserVocab('${v.id}')" style="cursor:pointer"` : ''}>
       <div class="vocab-tag">${tag}</div>
       <div class="vocab-content">
         <div class="vocab-blocked">⚠ ${v.blocked}</div>
         <div class="vocab-fluid">→ ${v.fluid}</div>
         <div class="vocab-example">"${v.example}"</div>
+        ${v.id ? `<div style="font-size:11px;color:var(--lime);margin-top:6px;font-weight:700">${niveauLabel} · Toucher pour progresser</div>` : ''}
       </div>
     </div>
-  `).join('');
+  `}).join('');
 }
 
-// EXERCISE DONE
-function markExerciseDone() {
-  if (state.exercisesDone < 3) {
-    state.exercisesDone++;
-    localStorage.setItem('voix-exercises', state.exercisesDone);
-    document.getElementById('stat-done').textContent = state.exercisesDone;
-    document.getElementById('prog-daily').style.width = (state.exercisesDone / 3 * 100) + '%';
-    showToast('✅ Exercice validé ! ' + state.exercisesDone + '/3 aujourd\'hui');
-  } else {
+// Progression du vocabulaire — clic pour avancer le niveau de maîtrise
+async function progresserVocab(vocabId) {
+  try {
+    const { data: current } = await sb.from('voix_vocabulaire').select('niveau_maitrise').eq('id', vocabId).single();
+    const nouveauNiveau = current.niveau_maitrise >= 2 ? 0 : current.niveau_maitrise + 1;
+
+    await sb.from('voix_vocabulaire')
+      .update({ niveau_maitrise: nouveauNiveau, derniere_pratique: new Date().toISOString().split('T')[0] })
+      .eq('id', vocabId);
+
+    if (nouveauNiveau === 2) {
+      showToast('🎯 Mot maîtrisé !');
+    }
+
+    // Recharge les compteurs et l'affichage
+    const { data: vocabMaitrise } = await sb
+      .from('voix_vocabulaire')
+      .select('id')
+      .eq('profil_id', state.profilId)
+      .eq('niveau_maitrise', 2);
+    state.vocabMastered = vocabMaitrise ? vocabMaitrise.length : 0;
+    document.getElementById('stat-vocab').textContent = state.vocabMastered;
+
+    renderVocab();
+  } catch (err) {
+    console.error('Erreur progression vocabulaire:', err);
+    showToast('⚠ Erreur de sauvegarde');
+  }
+}
+
+// EXERCISE DONE — écrit dans Supabase
+async function markExerciseDone() {
+  if (state.exercisesDone >= 3) {
     showToast('🏆 Tous les exercices du jour sont faits !');
+    return;
+  }
+
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    await sb.from('voix_exercices').insert({
+      profil_id: state.profilId,
+      jour: state.currentDay,
+      semaine: Math.ceil(state.currentDay / 7),
+      titre_exercice: 'Exercice du ' + today,
+      session: state.exercisesDone === 0 ? 'Matin' : 'Soir',
+      complete: true,
+      date_completion: today
+    });
+
+    state.exercisesDone++;
+    document.getElementById('stat-done').textContent = state.exercisesDone;
+    document.getElementById('prog-daily').style.width = (Math.min(state.exercisesDone,3) / 3 * 100) + '%';
+    showToast('✅ Exercice validé ! ' + state.exercisesDone + '/3 aujourd\'hui — sauvegardé');
+
+    // Met à jour le streak si c'est le premier exercice du jour
+    if (state.exercisesDone === 1) {
+      await sb.from('voix_profil')
+        .update({ derniere_activite: today })
+        .eq('id', state.profilId);
+    }
+  } catch (err) {
+    console.error('Erreur sauvegarde exercice:', err);
+    showToast('⚠ Erreur de sauvegarde — réessaie');
   }
 }
 
